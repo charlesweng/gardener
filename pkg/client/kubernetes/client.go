@@ -20,7 +20,6 @@ import (
 	"fmt"
 
 	gardencoreclientset "github.com/gardener/gardener/pkg/client/core/clientset/versioned"
-	kutil "github.com/gardener/gardener/pkg/utils/kubernetes"
 	versionutils "github.com/gardener/gardener/pkg/utils/version"
 
 	corev1 "k8s.io/api/core/v1"
@@ -94,7 +93,7 @@ func NewClientFromBytes(kubeconfig []byte, fns ...ConfigFunc) (Interface, error)
 // be used.
 func NewClientFromSecret(ctx context.Context, c client.Client, namespace, secretName string, fns ...ConfigFunc) (Interface, error) {
 	secret := &corev1.Secret{}
-	if err := c.Get(ctx, kutil.Key(namespace, secretName), secret); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, secret); err != nil {
 		return nil, err
 	}
 	return NewClientFromSecretObject(secret, fns...)
@@ -135,18 +134,9 @@ func RESTConfigFromClientConnectionConfiguration(cfg *componentbaseconfig.Client
 			return nil, err
 		}
 	} else {
-		clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeconfig)
+		restConfig, err = RESTConfigFromKubeconfig(kubeconfig)
 		if err != nil {
-			return nil, err
-		}
-
-		if err := validateClientConfig(clientConfig); err != nil {
-			return nil, err
-		}
-
-		restConfig, err = clientConfig.ClientConfig()
-		if err != nil {
-			return nil, err
+			return restConfig, err
 		}
 	}
 
@@ -157,6 +147,24 @@ func RESTConfigFromClientConnectionConfiguration(cfg *componentbaseconfig.Client
 		restConfig.ContentType = cfg.ContentType
 	}
 
+	return restConfig, nil
+}
+
+// RESTConfigFromKubeconfig returns a rest.Config from the bytes of a kubeconfig
+func RESTConfigFromKubeconfig(kubeconfig []byte) (*rest.Config, error) {
+	clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := validateClientConfig(clientConfig); err != nil {
+		return nil, err
+	}
+
+	restConfig, err := clientConfig.ClientConfig()
+	if err != nil {
+		return nil, err
+	}
 	return restConfig, nil
 }
 
@@ -202,6 +210,7 @@ var supportedKubernetesVersions = []string{
 	"1.16",
 	"1.17",
 	"1.18",
+	"1.19",
 }
 
 func checkIfSupportedKubernetesVersion(gitVersion string) error {

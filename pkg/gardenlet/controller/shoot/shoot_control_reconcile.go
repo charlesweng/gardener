@@ -134,16 +134,11 @@ func (c *Controller) runReconcileShootFlow(o *operation.Operation) *gardencorev1
 			Fn:           flow.TaskFn(botanist.Shoot.Components.ControlPlane.KubeAPIServerService.Wait).SkipIf(o.Shoot.HibernationEnabled && !useSNI),
 			Dependencies: flow.NewTaskIDs(deployKubeAPIServerService),
 		})
-		loadSecrets = g.Add(flow.Task{
-			Name:         "Loading existing secrets into ShootState",
-			Fn:           flow.TaskFn(botanist.LoadExistingSecretsIntoShootState),
-			Dependencies: flow.NewTaskIDs(deployNamespace, ensureShootStateExists),
-		})
 		generateSecrets = g.Add(flow.Task{
 			Name: "Generating secrets and saving them into ShootState",
 			Fn:   flow.TaskFn(botanist.GenerateAndSaveSecrets),
 			Dependencies: func() flow.TaskIDs {
-				taskIDs := flow.NewTaskIDs(deployNamespace, loadSecrets, ensureShootStateExists)
+				taskIDs := flow.NewTaskIDs(deployNamespace, ensureShootStateExists)
 				if !dnsEnabled && !o.Shoot.HibernationEnabled {
 					taskIDs.Insert(waitUntilKubeAPIServerServiceIsReady)
 				}
@@ -181,7 +176,7 @@ func (c *Controller) runReconcileShootFlow(o *operation.Operation) *gardencorev1
 				if err := botanist.WaitForInfrastructure(ctx); err != nil {
 					return err
 				}
-				return removeTaskAnnotation(o, generation, common.ShootTaskDeployInfrastructure)
+				return removeTaskAnnotation(ctx, o, generation, common.ShootTaskDeployInfrastructure)
 			},
 			Dependencies: flow.NewTaskIDs(deployInfrastructure),
 		})
@@ -222,12 +217,12 @@ func (c *Controller) runReconcileShootFlow(o *operation.Operation) *gardencorev1
 		generateEncryptionConfigurationMetaData = g.Add(flow.Task{
 			Name:         "Generating etcd encryption configuration",
 			Fn:           flow.TaskFn(botanist.GenerateEncryptionConfiguration).DoIf(enableEtcdEncryption),
-			Dependencies: flow.NewTaskIDs(deployNamespace, ensureShootStateExists, loadSecrets, generateSecrets),
+			Dependencies: flow.NewTaskIDs(deployNamespace, ensureShootStateExists),
 		})
 		persistETCDEncryptionConfiguration = g.Add(flow.Task{
 			Name:         "Persisting etcd encryption configuration in ShootState",
 			Fn:           flow.TaskFn(botanist.PersistEncryptionConfiguration).DoIf(enableEtcdEncryption),
-			Dependencies: flow.NewTaskIDs(deployNamespace, ensureShootStateExists, generateEncryptionConfigurationMetaData, loadSecrets, generateSecrets),
+			Dependencies: flow.NewTaskIDs(deployNamespace, ensureShootStateExists, generateEncryptionConfigurationMetaData, generateSecrets),
 		})
 		// TODO: This can be removed in a future version once all etcd encryption configuration secrets have been cleaned up.
 		_ = g.Add(flow.Task{
@@ -400,23 +395,23 @@ func (c *Controller) runReconcileShootFlow(o *operation.Operation) *gardencorev1
 		})
 		deployContainerRuntimeResources = g.Add(flow.Task{
 			Name:         "Deploying container runtime resources",
-			Fn:           flow.TaskFn(botanist.DeployContainerRuntimeResources).RetryUntilTimeout(defaultInterval, defaultTimeout),
+			Fn:           flow.TaskFn(botanist.DeployContainerRuntime).RetryUntilTimeout(defaultInterval, defaultTimeout),
 			Dependencies: flow.NewTaskIDs(deployReferencedResources, initializeShootClients),
 		})
 		_ = g.Add(flow.Task{
 			Name:         "Waiting until container runtime resources are ready",
-			Fn:           flow.TaskFn(botanist.WaitUntilContainerRuntimeResourcesReady),
+			Fn:           botanist.Shoot.Components.Extensions.ContainerRuntime.Wait,
 			Dependencies: flow.NewTaskIDs(deployContainerRuntimeResources),
 		})
-		deleteStaleContainerRuntimeResources = g.Add(flow.Task{
+		deleteStaleResources = g.Add(flow.Task{
 			Name:         "Delete stale container runtime resources",
-			Fn:           flow.TaskFn(botanist.DeleteStaleContainerRuntimeResources).RetryUntilTimeout(defaultInterval, defaultTimeout),
+			Fn:           flow.TaskFn(botanist.Shoot.Components.Extensions.ContainerRuntime.DeleteStaleResources).RetryUntilTimeout(defaultInterval, defaultTimeout),
 			Dependencies: flow.NewTaskIDs(initializeShootClients),
 		})
 		_ = g.Add(flow.Task{
 			Name:         "Waiting until stale container runtime resources are deleted",
-			Fn:           flow.TaskFn(botanist.WaitUntilContainerRuntimeResourcesDeleted).SkipIf(o.Shoot.HibernationEnabled),
-			Dependencies: flow.NewTaskIDs(deleteStaleContainerRuntimeResources),
+			Fn:           flow.TaskFn(botanist.Shoot.Components.Extensions.ContainerRuntime.WaitCleanup).SkipIf(o.Shoot.HibernationEnabled),
+			Dependencies: flow.NewTaskIDs(deleteStaleResources),
 		})
 		_ = g.Add(flow.Task{
 			Name: "Restart control plane pods",
@@ -424,7 +419,7 @@ func (c *Controller) runReconcileShootFlow(o *operation.Operation) *gardencorev1
 				if err := botanist.RestartControlPlanePods(ctx); err != nil {
 					return err
 				}
-				return removeTaskAnnotation(o, generation, common.ShootTaskRestartControlPlanePods)
+				return removeTaskAnnotation(ctx, o, generation, common.ShootTaskRestartControlPlanePods)
 			}).DoIf(requestControlPlanePodsRestart),
 			Dependencies: flow.NewTaskIDs(deployKubeControllerManager, deployControlPlane, deployControlPlaneExposure),
 		})
@@ -467,8 +462,8 @@ func (c *Controller) runReconcileShootFlow(o *operation.Operation) *gardencorev1
 	return nil
 }
 
-func removeTaskAnnotation(o *operation.Operation, generation int64, tasksToRemove ...string) error {
-	newShoot, err := kutil.TryUpdateShootAnnotations(o.K8sGardenClient.GardenCore(), retry.DefaultRetry, o.Shoot.Info.ObjectMeta,
+func removeTaskAnnotation(ctx context.Context, o *operation.Operation, generation int64, tasksToRemove ...string) error {
+	newShoot, err := kutil.TryUpdateShootAnnotations(ctx, o.K8sGardenClient.GardenCore(), retry.DefaultRetry, o.Shoot.Info.ObjectMeta,
 		func(shoot *gardencorev1beta1.Shoot) (*gardencorev1beta1.Shoot, error) {
 			if shoot.Generation == generation {
 				controllerutils.RemoveTasks(shoot.Annotations, tasksToRemove...)

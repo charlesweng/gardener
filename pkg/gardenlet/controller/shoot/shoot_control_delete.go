@@ -44,7 +44,7 @@ import (
 
 // runDeleteShootFlow deletes a Shoot cluster entirely.
 // It receives an Operation object <o> which stores the Shoot object and an ErrorContext which contains error from the previous operation.
-func (c *Controller) runDeleteShootFlow(o *operation.Operation) *gardencorev1beta1helper.WrappedLastErrors {
+func (c *Controller) runDeleteShootFlow(ctx context.Context, o *operation.Operation) *gardencorev1beta1helper.WrappedLastErrors {
 	var (
 		botanist                             *botanistpkg.Botanist
 		shootNamespaceInDeletion             bool
@@ -111,7 +111,7 @@ func (c *Controller) runDeleteShootFlow(o *operation.Operation) *gardencorev1bet
 			if o.Shoot.Info.Namespace == v1beta1constants.GardenNamespace && o.ShootedSeed != nil {
 				// wait for seed object to be deleted before going on with shoot deletion
 				if err := retryutils.UntilTimeout(context.TODO(), time.Second, 300*time.Second, func(context.Context) (done bool, err error) {
-					_, err = o.K8sGardenClient.GardenCore().CoreV1beta1().Seeds().Get(o.Shoot.Info.Name, metav1.GetOptions{})
+					_, err = o.K8sGardenClient.GardenCore().CoreV1beta1().Seeds().Get(ctx, o.Shoot.Info.Name, kubernetes.DefaultGetOptions())
 					if apierrors.IsNotFound(err) {
 						return retryutils.Ok()
 					}
@@ -202,20 +202,15 @@ func (c *Controller) runDeleteShootFlow(o *operation.Operation) *gardencorev1bet
 			Name: "Deploying cloud provider account secret",
 			Fn:   flow.TaskFn(botanist.DeployCloudProviderSecret).SkipIf(shootNamespaceInDeletion),
 		})
-		loadSecrets = g.Add(flow.Task{
-			Name:         "Loading existing secrets into ShootState",
-			Fn:           flow.TaskFn(botanist.LoadExistingSecretsIntoShootState).SkipIf(shootNamespaceInDeletion),
-			Dependencies: flow.NewTaskIDs(ensureShootStateExists),
-		})
 		generateSecrets = g.Add(flow.Task{
 			Name:         "Generating secrets and saving them into ShootState",
 			Fn:           flow.TaskFn(botanist.GenerateAndSaveSecrets).SkipIf(shootNamespaceInDeletion),
-			Dependencies: flow.NewTaskIDs(loadSecrets, ensureShootStateExists),
+			Dependencies: flow.NewTaskIDs(ensureShootStateExists),
 		})
 		deploySecrets = g.Add(flow.Task{
 			Name:         "Deploying Shoot certificates / keys",
 			Fn:           flow.TaskFn(botanist.DeploySecrets).SkipIf(shootNamespaceInDeletion),
-			Dependencies: flow.NewTaskIDs(ensureShootStateExists, loadSecrets, generateSecrets),
+			Dependencies: flow.NewTaskIDs(ensureShootStateExists, generateSecrets),
 		})
 		// Redeploy the control plane to make sure all components that depend on the cloud provider secret are restarted
 		// in case it has changed. Also, it's needed for other control plane components like the kube-apiserver or kube-
@@ -346,12 +341,12 @@ func (c *Controller) runDeleteShootFlow(o *operation.Operation) *gardencorev1bet
 		})
 		deleteContainerRuntimeResources = g.Add(flow.Task{
 			Name:         "Deleting container runtime resources",
-			Fn:           flow.TaskFn(botanist.DeleteAllContainerRuntimeResources).RetryUntilTimeout(defaultInterval, defaultTimeout),
+			Fn:           flow.TaskFn(botanist.Shoot.Components.Extensions.ContainerRuntime.Destroy).RetryUntilTimeout(defaultInterval, defaultTimeout),
 			Dependencies: flow.NewTaskIDs(initializeShootClients, cleanKubernetesResources, cleanShootNamespaces),
 		})
 		waitUntilContainerRuntimeResourcesDeleted = g.Add(flow.Task{
 			Name:         "Waiting until stale container runtime resources are deleted",
-			Fn:           botanist.WaitUntilContainerRuntimeResourcesDeleted,
+			Fn:           botanist.Shoot.Components.Extensions.ContainerRuntime.WaitCleanup,
 			Dependencies: flow.NewTaskIDs(deleteContainerRuntimeResources),
 		})
 
@@ -494,7 +489,7 @@ func (c *Controller) runDeleteShootFlow(o *operation.Operation) *gardencorev1bet
 }
 
 func (c *Controller) removeFinalizerFrom(ctx context.Context, gardenClient kubernetes.Interface, shoot *gardencorev1beta1.Shoot) error {
-	newShoot, err := c.updateShootStatusOperationSuccess(gardenClient.GardenCore(), shoot, "", gardencorev1beta1.LastOperationTypeDelete)
+	newShoot, err := c.updateShootStatusOperationSuccess(ctx, gardenClient.GardenCore(), shoot, "", gardencorev1beta1.LastOperationTypeDelete)
 	if err != nil {
 		return err
 	}
